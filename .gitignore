@@ -1,0 +1,40 @@
+# Environment variables and secrets
+.env
+.env.*
+!.env.example
+**/.env
+**/.env.*
+!**/.env.example
+
+# Dependencies
+**/node_modules/
+**/vendor/
+
+# Build outputs and caches
+**/dist/
+**/build/
+**/public/build/
+**/.vite/
+**/coverage/
+
+# Local SQLite databases
+/backend/database/*.sqlite
+/backend/database/*.sqlite-*
+
+# Laravel generated logs and runtime files
+/backend/storage/logs/*.log
+/backend/storage/framework/cache/data/*
+/backend/storage/framework/sessions/*
+/backend/storage/framework/views/*
+/backend/bootstrap/cache/*.php
+/backend/storage/*.key
+
+# Local editor and operating system files
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+*.log
+
+# Postman environment exports may contain credentials
+*.postman_environment.json

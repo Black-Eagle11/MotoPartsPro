@@ -1,0 +1,362 @@
+
+name: MotoPartsPro CI/CD
+
+on:
+  push:
+    branches:
+      - main
+      - master
+      - develop
+
+  pull_request:
+    branches:
+      - main
+      - master
+      - develop
+
+  workflow_dispatch:
+
+# Prinsip least privilege: pipeline hanya memerlukan akses baca repositori.
+permissions:
+  contents: read
+
+# Membatalkan run lama untuk branch/PR yang sama.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  frontend:
+    name: Frontend - Lint, Test, Build
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    defaults:
+      run:
+        working-directory: frontend
+
+    env:
+      VITE_API_BASE_URL: ${{ vars.VITE_API_BASE_URL || 'http://127.0.0.1:8000/api' }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Install frontend dependencies
+        run: npm ci
+
+      - name: Lint frontend
+        run: npm run lint
+
+      - name: Run frontend tests
+        run: npm run test
+
+      - name: Build frontend
+        run: npm run build
+
+      - name: Upload frontend build artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: motopartspro-frontend-dist
+          path: frontend/dist/
+          if-no-files-found: error
+          retention-days: 14
+
+  backend:
+    name: Backend - Composer, MySQL, Migrations, Tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    defaults:
+      run:
+        working-directory: backend
+
+    env:
+      APP_ENV: testing
+      APP_DEBUG: "true"
+      APP_URL: http://localhost
+
+      DB_CONNECTION: mysql
+      DB_HOST: 127.0.0.1
+      DB_PORT: "3306"
+      DB_DATABASE: motopartspro_test
+      DB_USERNAME: root
+      DB_PASSWORD: root
+
+      CACHE_STORE: array
+      SESSION_DRIVER: array
+      QUEUE_CONNECTION: sync
+      MAIL_MAILER: array
+
+    services:
+      mysql:
+        image: mysql:8.0
+        env:
+          MYSQL_ROOT_PASSWORD: root
+          MYSQL_DATABASE: motopartspro_test
+        ports:
+          - 3306:3306
+        options: >-
+          --health-cmd="mysqladmin ping --host=127.0.0.1 --user=root --password=root --silent"
+          --health-interval=10s
+          --health-timeout=5s
+          --health-retries=10
+          --health-start-period=30s
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Setup PHP
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: "8.5"
+          extensions: mbstring, pdo_mysql, bcmath, intl, zip
+          tools: composer:v2
+          coverage: none
+
+      - name: Display runtime versions
+        run: |
+          php --version
+          composer --version
+
+      - name: Validate Composer configuration
+        run: composer validate --no-check-publish
+
+      - name: Install backend dependencies
+        run: composer install --prefer-dist --no-interaction --no-progress --optimize-autoloader
+
+      - name: Prepare Laravel environment
+        run: |
+          cp .env.example .env
+
+          mkdir -p \
+            storage/app/public \
+            storage/framework/cache/data \
+            storage/framework/sessions \
+            storage/framework/testing \
+            storage/framework/views \
+            storage/logs \
+            bootstrap/cache
+
+          php artisan key:generate --force
+          php artisan config:clear
+
+      - name: Run database migrations against MySQL
+        run: php artisan migrate --force
+
+      - name: Verify Laravel routes can be loaded
+        run: php artisan route:list --path=api
+
+      - name: Run backend tests
+        run: php artisan test
+
+  deploy:
+    name: Deploy to Production VPS
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    needs:
+      - frontend
+      - backend
+
+    # Deployment tidak berjalan pada pull request atau push biasa ke branch lain.
+    # Aktifkan dengan repository/environment variable DEPLOY_ENABLED=true.
+    if: >-
+      github.event_name == 'push' &&
+      github.ref == 'refs/heads/main' &&
+      vars.DEPLOY_ENABLED == 'true'
+
+    environment:
+      name: production
+
+    env:
+      DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+      DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
+      DEPLOY_SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+      DEPLOY_KNOWN_HOSTS: ${{ secrets.DEPLOY_KNOWN_HOSTS }}
+
+      DEPLOY_PORT: ${{ vars.DEPLOY_PORT || '22' }}
+      DEPLOY_FRONTEND_PATH: ${{ vars.DEPLOY_FRONTEND_PATH }}
+      DEPLOY_BACKEND_PATH: ${{ vars.DEPLOY_BACKEND_PATH }}
+      VITE_API_BASE_URL: ${{ vars.VITE_API_BASE_URL }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Validate deployment configuration
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          for name in \
+            DEPLOY_HOST \
+            DEPLOY_USER \
+            DEPLOY_SSH_KEY \
+            DEPLOY_KNOWN_HOSTS \
+            DEPLOY_FRONTEND_PATH \
+            DEPLOY_BACKEND_PATH \
+            VITE_API_BASE_URL
+          do
+            if [[ -z "${!name:-}" ]]; then
+              echo "::error::Deployment variable/secret $name belum diatur."
+              exit 1
+            fi
+          done
+
+          if [[ ! "$DEPLOY_PORT" =~ ^[0-9]+$ ]] ||
+             (( DEPLOY_PORT < 1 || DEPLOY_PORT > 65535 )); then
+            echo "::error::DEPLOY_PORT harus berupa port yang valid."
+            exit 1
+          fi
+
+          for path in "$DEPLOY_FRONTEND_PATH" "$DEPLOY_BACKEND_PATH"; do
+            if [[ "$path" != /* || "$path" == *"'"* ]]; then
+              echo "::error::Path deployment harus absolut dan tidak boleh mengandung tanda petik tunggal."
+              exit 1
+            fi
+          done
+
+          if [[ "$DEPLOY_FRONTEND_PATH" == "$DEPLOY_BACKEND_PATH" ]]; then
+            echo "::error::Path frontend dan backend harus berbeda."
+            exit 1
+          fi
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Build production frontend
+        working-directory: frontend
+        run: |
+          npm ci
+          npm run build
+
+      - name: Upload production frontend artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: motopartspro-production-dist
+          path: frontend/dist/
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Configure SSH
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          install -m 700 -d "$HOME/.ssh"
+
+          printf '%s\n' "$DEPLOY_SSH_KEY" \
+            > "$HOME/.ssh/id_ed25519"
+
+          chmod 600 "$HOME/.ssh/id_ed25519"
+
+          printf '%s\n' "$DEPLOY_KNOWN_HOSTS" \
+            > "$HOME/.ssh/known_hosts"
+
+          chmod 600 "$HOME/.ssh/known_hosts"
+
+      - name: Prepare remote directories
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          SSH_CMD=(
+            ssh
+            -p "$DEPLOY_PORT"
+            -i "$HOME/.ssh/id_ed25519"
+            -o StrictHostKeyChecking=yes
+            -o IdentitiesOnly=yes
+          )
+
+          "${SSH_CMD[@]}" "$DEPLOY_USER@$DEPLOY_HOST" \
+            "mkdir -p -- '$DEPLOY_FRONTEND_PATH' '$DEPLOY_BACKEND_PATH'"
+
+      - name: Upload backend application files
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          SSH_RSYNC="ssh -p $DEPLOY_PORT -i $HOME/.ssh/id_ed25519 -o StrictHostKeyChecking=yes -o IdentitiesOnly=yes"
+
+          rsync -az --delete \
+            --exclude='.env' \
+            --exclude='.git/' \
+            --exclude='vendor/' \
+            --exclude='storage/' \
+            --exclude='tests/' \
+            --exclude='node_modules/' \
+            --exclude='database/*.sqlite' \
+            --exclude='public/storage' \
+            -e "$SSH_RSYNC" \
+            backend/ \
+            "$DEPLOY_USER@$DEPLOY_HOST:$DEPLOY_BACKEND_PATH/"
+
+      - name: Install production dependencies and migrate
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          SSH_CMD=(
+            ssh
+            -p "$DEPLOY_PORT"
+            -i "$HOME/.ssh/id_ed25519"
+            -o StrictHostKeyChecking=yes
+            -o IdentitiesOnly=yes
+          )
+
+          "${SSH_CMD[@]}" "$DEPLOY_USER@$DEPLOY_HOST" \
+            "bash -se" <<EOF
+          set -euo pipefail
+
+          cd "$DEPLOY_BACKEND_PATH"
+
+          # File .env dan storage server tetap dipertahankan.
+          composer install --no-dev --prefer-dist --no-interaction --optimize-autoloader
+
+          php artisan optimize:clear
+          php artisan migrate --force
+
+          if [[ ! -L public/storage ]]; then
+            php artisan storage:link
+          fi
+
+          php artisan config:cache
+          php artisan view:cache
+          EOF
+
+      - name: Publish frontend build
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          SSH_RSYNC="ssh -p $DEPLOY_PORT -i $HOME/.ssh/id_ed25519 -o StrictHostKeyChecking=yes -o IdentitiesOnly=yes"
+
+          rsync -az --delete \
+            -e "$SSH_RSYNC" \
+            frontend/dist/ \
+            "$DEPLOY_USER@$DEPLOY_HOST:$DEPLOY_FRONTEND_PATH/"
+
+      - name: Deployment summary
+        run: |
+          echo "Deployment selesai."
+          echo "Commit: $GITHUB_SHA"
+          echo "Frontend dan backend telah dikirim ke VPS."
